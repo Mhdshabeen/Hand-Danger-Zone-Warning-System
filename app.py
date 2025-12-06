@@ -4,31 +4,36 @@ import math
 import tensorflow as tf
 import os
 
+# Use TF1-style graph/session inside TF2
 tf.compat.v1.disable_eager_execution()
 
-# Model path declaration fo model detection
-BASE_DIR = (os.path.dirname(os.path.abspath(__file__)))
-MODEL_PATH = os.path.join(BASE_DIR, 'model', 'frozen_inference_graph.pb')
+# ----------------- CONFIG -----------------
 
-# Manually define object zone in the frame 
+# Base folder and model path
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+MODEL_PATH = os.path.join(BASE_DIR, "model", "frozen_inference_graph.pb")
+
+# Manually define object / danger zone in the frame
 # (x1, y1, x2, y2) in pixels after resizing to 640x480
 ZONE_BOX = (560, 120, 630, 320)
 
 # Distance thresholds (in pixels)
-SAFE_THRESH = 100
-DANGER_THRESH = 50
+SAFE_THRESH = 120
+DANGER_THRESH = 60
+
+
+# ----------------- UTILS -----------------
 
 def rect_distance(r1, r2):
 
     x1_min, y1_min, x1_max, y1_max = r1
     x2_min, y2_min, x2_max, y2_max = r2
-
     dx = max(x1_min - x2_max, x2_min - x1_max, 0)
     dy = max(y1_min - y2_max, y2_min - y1_max, 0)
     return math.sqrt(dx * dx + dy * dy)
 
-def load_ssd_graph(model_path):
 
+def load_ssd_graph(model_path):
     if not os.path.exists(model_path):
         raise FileNotFoundError(f"Model file not found: {model_path}")
 
@@ -42,7 +47,6 @@ def load_ssd_graph(model_path):
 
     sess = tf.compat.v1.Session(graph=detection_graph)
 
-    # Standard TF Object Detection API tensor names
     image_tensor = detection_graph.get_tensor_by_name("image_tensor:0")
     boxes_tensor = detection_graph.get_tensor_by_name("detection_boxes:0")
     scores_tensor = detection_graph.get_tensor_by_name("detection_scores:0")
@@ -52,7 +56,43 @@ def load_ssd_graph(model_path):
     return (detection_graph, sess,
             image_tensor, boxes_tensor, scores_tensor, classes_tensor, num_detections_tensor)
 
-class SSDHandDetector:
+
+def box_center(box):
+
+    x1, y1, x2, y2 = box
+    cx = (x1 + x2) / 2.0
+    cy = (y1 + y2) / 2.0
+    return cx, cy
+
+
+def suppress_by_center(boxes, scores, center_thresh=60):
+
+    if not boxes:
+        return []
+
+    idxs = np.argsort(scores)[::-1]
+    keep = []
+    keep_centers = []
+
+    for idx in idxs:
+        bx = boxes[idx]
+        cx, cy = box_center(bx)
+
+        too_close = False
+        for (kc_x, kc_y) in keep_centers:
+            dist = math.sqrt((cx - kc_x) ** 2 + (cy - kc_y) ** 2)
+            if dist < center_thresh:
+                too_close = True
+                break
+
+        if not too_close:
+            keep.append(idx)
+            keep_centers.append((cx, cy))
+
+    return keep
+
+
+class HandDetector:
     def __init__(self, model_path):
         (self.graph,
          self.sess,
@@ -62,7 +102,8 @@ class SSDHandDetector:
          self.classes_tensor,
          self.num_detections_tensor) = load_ssd_graph(model_path)
 
-    def detect_hands(self, frame, score_thresh=0.5):
+    def detect_hands(self, frame, score_thresh=0.5, center_thresh=60):
+       
         h, w = frame.shape[:2]
         image_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         image_expanded = np.expand_dims(image_rgb, axis=0)
@@ -75,7 +116,9 @@ class SSDHandDetector:
 
         boxes = boxes[0]   
         scores = scores[0]
-        results = []
+
+        raw_boxes = []
+        raw_scores = []
         for i in range(len(scores)):
             if scores[i] < score_thresh:
                 continue
@@ -85,16 +128,23 @@ class SSDHandDetector:
             y1 = int(ymin * h)
             x2 = int(xmax * w)
             y2 = int(ymax * h)
-            results.append((x1, y1, x2, y2, float(scores[i])))
+            raw_boxes.append((x1, y1, x2, y2))
+            raw_scores.append(float(scores[i]))
+
+        keep_indices = suppress_by_center(raw_boxes, raw_scores,
+                                          center_thresh=center_thresh)
+
+        results = []
+        for idx in keep_indices:
+            x1, y1, x2, y2 = raw_boxes[idx]
+            score = raw_scores[idx]
+            results.append((x1, y1, x2, y2, score))
 
         return results
 
-
-# WARNING SYSTEM 
-
 def main():
-    # Load detector
-    detector = SSDHandDetector(MODEL_PATH)
+    detector = HandDetector(MODEL_PATH)
+
     cap = cv2.VideoCapture(0)
     if not cap.isOpened():
         print("Error: Cannot open camera.")
@@ -115,36 +165,45 @@ def main():
         cv2.putText(frame, "Zone", (bx1, max(0, by1 - 10)),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
-        # Detect hands
-        hands = detector.detect_hands(frame, score_thresh=0.5)
+        hands = detector.detect_hands(frame, score_thresh=0.5, center_thresh=60)
 
+        # Default state
         state = "NO HAND"
         color = (200, 200, 200)
-        dist = None
+        min_dist = None  
 
         if hands:
-            hx1, hy1, hx2, hy2, score = max(hands, key=lambda b: b[4])
-            cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 255, 255), 2)
-            cv2.putText(frame, f"Hand {score:.2f}", (hx1, max(0, hy1 - 10)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
-            dist = rect_distance(ZONE_BOX, (hx1, hy1, hx2, hy2))
+            for (hx1, hy1, hx2, hy2, score) in hands:
+               
+                cv2.rectangle(frame, (hx1, hy1), (hx2, hy2), (0, 255, 255), 2)
+                cv2.putText(frame, f"Hand {score:.2f}", (hx1, max(0, hy1 - 10)),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
 
-            if dist > SAFE_THRESH:
-                state = "SAFE"
-                color = (0, 255, 0)
-            elif dist > DANGER_THRESH:
-                state = "WARNING"
-                color = (0, 255, 255)
-            else:
-                state = "DANGER"
-                color = (0, 0, 255)
+                
+                d = rect_distance(ZONE_BOX, (hx1, hy1, hx2, hy2))
 
+                if min_dist is None or d < min_dist:
+                    min_dist = d
+
+            # Global state based on closest hand (worst case)
+            if min_dist is not None:
+                if min_dist > SAFE_THRESH:
+                    state = "SAFE"
+                    color = (0, 255, 0)
+                elif min_dist > DANGER_THRESH:
+                    state = "WARNING"
+                    color = (0, 255, 255)
+                else:
+                    state = "DANGER"
+                    color = (0, 0, 255)
+
+        # State overlay
         cv2.rectangle(frame, (10, 10), (270, 80), (0, 0, 0), -1)
         cv2.putText(frame, f"STATE: {state}", (20, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
 
-        if dist is not None:
-            cv2.putText(frame, f"Dist: {int(dist)} px", (10, 110),
+        if min_dist is not None:
+            cv2.putText(frame, f"Min Dist: {int(min_dist)} px", (10, 110),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
 
         if state in ["SAFE", "WARNING", "DANGER"]:
