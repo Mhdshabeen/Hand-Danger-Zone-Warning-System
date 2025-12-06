@@ -197,7 +197,6 @@ def main():
                     state = "DANGER"
                     color = (0, 0, 255)
 
-        # State overlay
         cv2.rectangle(frame, (10, 10), (270, 80), (0, 0, 0), -1)
         cv2.putText(frame, f"STATE: {state}", (20, 50),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2, cv2.LINE_AA)
